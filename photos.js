@@ -1,18 +1,16 @@
 (function () {
 	if (!isMotherDayNewTabPage()) return;
 
-	const DEFAULT_PHOTO_COUNT = 1444;
-	const DEFAULT_PHOTO_FOLDER = "photos";
-	const DEFAULT_PHOTO_EXT = ".jpg";
 	const CACHE_MAX = 80;
 	const STREAM_EDGE_MARGIN = 10;
 	const STREAM_X_PHASE = 0.61803398875;
 	const STREAM_SLOT_JITTER = 0.34;
+	const OFFSCREEN_MOUSE = -9999;
 
 	const canvas = document.getElementById("photo-canvas");
 	const ctx = canvas.getContext("2d");
 
-	let activeSources = buildBundledSources();
+	let activeSources = [];
 	let pool = [];
 	let poolPos = 0;
 	let sourceVersion = 0;
@@ -26,8 +24,9 @@
 		angleDeg = 0,
 		raf;
 
-	let mouseX = -9999,
-		mouseY = -9999;
+	let mouseX = OFFSCREEN_MOUSE,
+		mouseY = OFFSCREEN_MOUSE;
+	let mouseIsOnPage = false;
 	let hoveredTile = null;
 
 	function shuffle(items) {
@@ -36,14 +35,6 @@
 			[items[i], items[j]] = [items[j], items[i]];
 		}
 		return items;
-	}
-
-	function buildBundledSources() {
-		return Array.from({ length: DEFAULT_PHOTO_COUNT }, (_, index) => ({
-			kind: "bundled",
-			index,
-			key: `bundled:${index}`,
-		}));
 	}
 
 	function buildPhotoSources(sources) {
@@ -75,6 +66,16 @@
 					index,
 					key: `file-handle:${index}:${path}`,
 				});
+			} else if (source?.kind === "fileUrl" && source.url) {
+				const url = String(source.url);
+				const path = source.path || url;
+				usableSources.push({
+					kind: "fileUrl",
+					url,
+					path,
+					index,
+					key: `file-url:${index}:${url}`,
+				});
 			}
 		}
 
@@ -92,10 +93,6 @@
 		poolPos++;
 		if (poolPos % pool.length === 0) shuffle(pool);
 		return source;
-	}
-
-	function bundledUrl(index) {
-		return chrome.runtime.getURL(`${DEFAULT_PHOTO_FOLDER}/${index}${DEFAULT_PHOTO_EXT}`);
 	}
 
 	function closeBitmap(bitmap) {
@@ -133,11 +130,15 @@
 			return rememberBitmap(cacheKey, await createImageBitmap(file));
 		}
 
-		if (cache.has(source.key)) return cache.get(source.key);
-		const response = await fetch(bundledUrl(source.index));
-		if (!response.ok) throw new Error(`Missing bundled photo ${source.index}.`);
-		const blob = await response.blob();
-		return rememberBitmap(source.key, await createImageBitmap(blob));
+		if (source.kind === "fileUrl") {
+			if (cache.has(source.key)) return cache.get(source.key);
+			const response = await fetch(source.url);
+			if (!response.ok) throw new Error(`Missing referenced photo ${source.path || source.url}.`);
+			const blob = await response.blob();
+			return rememberBitmap(source.key, await createImageBitmap(blob));
+		}
+
+		throw new Error("Unsupported photo source.");
 	}
 
 	async function nextBitmap(maxAttempts = 30) {
@@ -149,7 +150,7 @@
 			try {
 				return await getBitmap(source);
 			} catch {
-				// Skip unreadable files and missing bundled slots.
+				// Skip unreadable sources.
 			}
 		}
 
@@ -178,7 +179,7 @@
 
 	function setPhotoSources(sources) {
 		const usableSources = buildPhotoSources(sources);
-		activeSources = usableSources.length ? usableSources : buildBundledSources();
+		activeSources = usableSources;
 		sourceVersion++;
 		cancelAnimationFrame(raf);
 		tiles = [];
@@ -195,13 +196,58 @@
 		setSources: setPhotoSources,
 	};
 
-	window.addEventListener("mousemove", (e) => {
+	function resetHoverState() {
+		hoveredTile = null;
+		for (const t of tiles) {
+			t.hoverScale = 1;
+			t.hoverAlpha = null;
+		}
+	}
+
+	function clearMousePosition(resetHover = false) {
+		mouseX = OFFSCREEN_MOUSE;
+		mouseY = OFFSCREEN_MOUSE;
+		mouseIsOnPage = false;
+		if (resetHover) resetHoverState();
+	}
+
+	function updateMousePosition(e) {
 		mouseX = e.clientX;
 		mouseY = e.clientY;
+		mouseIsOnPage = true;
+	}
+
+	function mouseIsCurrentlyOnPage() {
+		return (
+			mouseIsOnPage &&
+			document.visibilityState === "visible" &&
+			document.documentElement.matches(":hover") &&
+			mouseX >= 0 &&
+			mouseX <= window.innerWidth &&
+			mouseY >= 0 &&
+			mouseY <= window.innerHeight
+		);
+	}
+
+	function refreshMousePosition() {
+		if (!mouseIsOnPage) return false;
+		if (mouseIsCurrentlyOnPage()) return true;
+
+		clearMousePosition(true);
+		return false;
+	}
+
+	const mouseMoveEvent = window.PointerEvent ? "pointermove" : "mousemove";
+	window.addEventListener(mouseMoveEvent, updateMousePosition, { passive: true });
+	window.addEventListener("mouseleave", () => clearMousePosition(true));
+	window.addEventListener("blur", () => clearMousePosition(true));
+	document.addEventListener("mouseleave", () => clearMousePosition(true));
+	document.addEventListener("pointerleave", () => clearMousePosition(true));
+	document.addEventListener("mouseout", (e) => {
+		if (!e.relatedTarget && !e.toElement) clearMousePosition(true);
 	});
-	window.addEventListener("mouseleave", () => {
-		mouseX = -9999;
-		mouseY = -9999;
+	document.addEventListener("visibilitychange", () => {
+		if (document.visibilityState !== "visible") clearMousePosition(true);
 	});
 
 	function resize() {
@@ -225,9 +271,10 @@
 	function applyBitmapToTile(t, bmp) {
 		const d = Math.random();
 		const sz = 80 + d * (80 * sizeVar - 80);
+		const aspectRatio = bmp.width / bmp.height || 1;
 		t.bmp = bmp;
 		t.depth = d;
-		t.w = sz * clamp(bmp.width / bmp.height, 0.8, 1.8);
+		t.w = sz * aspectRatio;
 		t.h = sz;
 		t.speed = (0.25 + d * 2.0) * speedVal;
 		t.alpha = 0.3 + d * 0.7;
@@ -373,6 +420,7 @@
 
 		const ar = (angleDeg * Math.PI) / 180;
 		const sorted = [...tiles].sort((a, b) => a.depth - b.depth);
+		const hasActiveMouse = refreshMousePosition();
 
 		hoveredTile = null;
 		for (const t of sorted) {
@@ -385,6 +433,7 @@
 			t._sw = scaledW;
 			t._sh = scaledH;
 			if (
+				hasActiveMouse &&
 				mouseX >= ox &&
 				mouseX <= ox + scaledW &&
 				mouseY >= oy &&

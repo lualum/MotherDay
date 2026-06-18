@@ -4,12 +4,14 @@
   if (!isMotherDayNewTabPage()) return;
 
   const FOLDER_SOURCE_MODE = "folder";
+  const REFERENCE_SOURCE_MODE = "referencePath";
   const DB_NAME = "MotherDayLocalPhotos";
   const DB_VERSION = 1;
   const HANDLE_STORE_NAME = "handles";
   const ACTIVE_DIRECTORY_HANDLE_KEY = "activeDirectory";
   const SOURCE_STORAGE_KEYS = ["photoReferencePath", "localPhotoSourceMode", "localPhotoSourceSummary"];
-  const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp", "image/avif"]);
+  const DIRECTORY_PICKER_ID = "motherday-photos";
+  const FILE_URL_ORIGIN = "file:///*";
   const IMAGE_EXT_PATTERN = /\.(avif|gif|jpe?g|png|webp)$/i;
   const LOG_PREFIX = "[MotherDayLocalPhotos]";
   const LOGGED_FILE_PATH_LIMIT = 25;
@@ -21,6 +23,9 @@
   };
 
   const els = {};
+  let savedPermissionHandle = null;
+  let savedPermissionSummary = null;
+  let needsFolderReselect = false;
 
   function $(id) {
     return document.getElementById(id);
@@ -59,12 +64,6 @@
     }
   }
 
-  function isImageFile(file) {
-    if (!file) return false;
-    if (IMAGE_TYPES.has(file.type)) return true;
-    return IMAGE_EXT_PATTERN.test(file.name || "");
-  }
-
   function isImageName(name) {
     return IMAGE_EXT_PATTERN.test(name || "");
   }
@@ -74,21 +73,6 @@
       numeric: true,
       sensitivity: "base",
     }));
-  }
-
-  function uniqueImageFiles(files) {
-    const seen = new Set();
-    const images = [];
-
-    for (const file of sortSources(files)) {
-      if (!isImageFile(file)) continue;
-      const key = `${fileLabel(file)}:${file.size}:${file.lastModified}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      images.push(file);
-    }
-
-    return images;
   }
 
   function commonRootPath(sources) {
@@ -106,13 +90,116 @@
   }
 
   function normalizeReferencePath(path) {
-    return String(path || "").replace(/[\r\n]+/g, " ").trim();
+    const normalizedPath = String(path || "").replace(/[\r\n]+/g, " ").trim();
+    if (normalizedPath === "/" || /^[A-Za-z]:[\\/]?$/.test(normalizedPath)) return normalizedPath;
+    return normalizedPath.replace(/[\\/]+$/g, "");
+  }
+
+  function pathBasename(path) {
+    return normalizeReferencePath(path).split(/[\\/]/).filter(Boolean).pop() || "";
+  }
+
+  function referencePathMatchesName(path, name) {
+    return !name || pathBasename(path) === name;
+  }
+
+  function pathRootThroughName(path, name) {
+    if (!name) return "";
+
+    const normalizedPath = normalizeReferencePath(path).replace(/\\/g, "/");
+    if (!isAbsoluteReferencePath(normalizedPath)) return "";
+
+    const parts = normalizedPath.split("/");
+    const index = parts.lastIndexOf(name);
+    if (index < 0) return "";
+
+    const rootPath = parts.slice(0, index + 1).join("/");
+    return normalizeReferencePath(rootPath || "/");
+  }
+
+  function referencePathCandidatesFromSummary(summary, name) {
+    const samplePaths = Array.isArray(summary?.sampleNames) ? summary.sampleNames : [];
+    return [
+      summary?.sourceLabel,
+      ...samplePaths.map((path) => pathRootThroughName(path, name)),
+    ];
+  }
+
+  function isAbsoluteReferencePath(path) {
+    const normalizedPath = normalizeReferencePath(path);
+    return normalizedPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(normalizedPath);
+  }
+
+  function joinReferencePath(rootPath, fileName) {
+    return `${normalizeReferencePath(rootPath).replace(/[\\/]+$/g, "")}/${fileName}`;
+  }
+
+  function encodePathSegments(path) {
+    return path.split("/").map((part) => encodeURIComponent(part)).join("/");
+  }
+
+  function fileUrlForPath(path) {
+    const normalizedPath = normalizeReferencePath(path).replace(/\\/g, "/");
+    const windowsPathMatch = normalizedPath.match(/^([A-Za-z]:)\/(.*)$/);
+
+    if (windowsPathMatch) {
+      return `file:///${windowsPathMatch[1]}/${encodePathSegments(windowsPathMatch[2])}`;
+    }
+
+    if (normalizedPath.startsWith("/")) {
+      return `file://${encodePathSegments(normalizedPath)}`;
+    }
+
+    return "";
+  }
+
+  function currentReferencePath() {
+    return normalizeReferencePath(els.pathInput?.value || state.referencePath);
+  }
+
+  function referencePathForName(name, ...fallbacks) {
+    const candidates = [
+      currentReferencePath(),
+      state.referencePath,
+      ...fallbacks,
+      name,
+    ].flat().map(normalizeReferencePath).filter(Boolean);
+    const absolutePath = candidates.find((path) => isAbsoluteReferencePath(path) && referencePathMatchesName(path, name));
+    if (absolutePath) return absolutePath;
+
+    const matchingPath = candidates.find((path) => referencePathMatchesName(path, name));
+    if (matchingPath) return matchingPath;
+
+    return candidates[0] || "";
+  }
+
+  function setSavedPermissionHandle(handle, summary = null) {
+    savedPermissionHandle = handle || null;
+    savedPermissionSummary = summary || null;
+    if (handle) needsFolderReselect = false;
+    updateSourceUI();
+  }
+
+  function setNeedsFolderReselect(needsReselect) {
+    needsFolderReselect = Boolean(needsReselect);
+    if (needsFolderReselect) {
+      savedPermissionHandle = null;
+      savedPermissionSummary = null;
+    }
+    updateSourceUI();
   }
 
   function updateSourceUI() {
     if (els.folderButton) {
       els.folderButton.classList.add("active");
       els.folderButton.setAttribute("aria-pressed", "true");
+      const buttonLabel = savedPermissionHandle
+        ? "Grant access to saved folder"
+        : needsFolderReselect
+          ? "Select saved folder again"
+          : "Read folder";
+      els.folderButton.setAttribute("aria-label", buttonLabel);
+      els.folderButton.title = buttonLabel;
     }
     if (els.pathInput && els.pathInput.value !== state.referencePath) {
       els.pathInput.value = state.referencePath;
@@ -129,20 +216,132 @@
     };
   }
 
-  function saveSummary(sourceLabel) {
+  function storageGet(area, keys) {
+    return new Promise((resolve) => {
+      if (!area) {
+        resolve({});
+        return;
+      }
+
+      area.get(keys, (result) => resolve(result || {}));
+    });
+  }
+
+  function storageSet(area, payload, areaLabel) {
+    if (!area) return;
+    area.set(payload, () => {
+      const err = chrome.runtime?.lastError;
+      if (err) console.warn(`${LOG_PREFIX} unable to save ${areaLabel} source state:`, err.message);
+    });
+  }
+
+  function hasSavedSourceState(result) {
+    return Boolean(normalizeReferencePath(result?.photoReferencePath) || result?.localPhotoSourceSummary?.count);
+  }
+
+  function chooseSavedState(localResult, syncResult) {
+    if (localResult?.localPhotoSourceSummary?.count) return { result: localResult, source: "local" };
+    if (syncResult?.localPhotoSourceSummary?.count) return { result: syncResult, source: "sync" };
+    if (hasSavedSourceState(localResult)) return { result: localResult, source: "local" };
+    if (hasSavedSourceState(syncResult)) return { result: syncResult, source: "sync" };
+    return { result: localResult || {}, source: "local" };
+  }
+
+  function pathPatternForSources(sources) {
+    const entries = [];
+
+    for (const source of sources) {
+      const name = pathBasename(sourceLabel(source));
+      const match = name.match(/^(\d+)(\.[a-z0-9]+)$/i);
+      if (!match) return null;
+
+      entries.push({
+        index: Number(match[1]),
+        extension: match[2].toLowerCase(),
+      });
+    }
+
+    if (!entries.length) return null;
+
+    const extension = entries[0].extension;
+    if (!entries.every((entry) => entry.extension === extension && Number.isSafeInteger(entry.index))) {
+      return null;
+    }
+
+    const indexes = entries.map((entry) => entry.index).sort((a, b) => a - b);
+    return {
+      start: indexes[0],
+      end: indexes[indexes.length - 1],
+      count: indexes.length,
+      extension,
+    };
+  }
+
+  function referencePatternFromSummary(summary) {
+    const pattern = summary?.filePathPattern;
+    const count = Number(pattern?.count);
+    const explicitStart = Number(pattern?.start);
+    const explicitEnd = Number(pattern?.end);
+    const extension = typeof pattern?.extension === "string" ? pattern.extension : "";
+    if (!Number.isSafeInteger(count) || count <= 0 || !extension) return null;
+
+    const start = Number.isSafeInteger(explicitStart)
+      ? explicitStart
+      : Number.isSafeInteger(explicitEnd)
+        ? explicitEnd - count + 1
+        : null;
+    if (!Number.isSafeInteger(start)) return null;
+
+    const end = Number.isSafeInteger(explicitEnd) ? explicitEnd : start + count - 1;
+    if (!Number.isSafeInteger(end) || end < start) return null;
+
+    return {
+      start,
+      end,
+      count: end - start + 1,
+      extension,
+    };
+  }
+
+  function buildReferencePathSources(referencePath, pattern) {
+    const sources = [];
+    if (!pattern) return sources;
+
+    for (let index = pattern.start; index <= pattern.end; index++) {
+      const path = joinReferencePath(referencePath, `${index}${pattern.extension}`);
+      const url = fileUrlForPath(path);
+      if (!url) continue;
+
+      sources.push({
+        kind: "fileUrl",
+        path,
+        url,
+      });
+    }
+
+    return sources;
+  }
+
+  function saveSummary(sourceLabel, sourceCount = state.sources.length) {
     const summary = summaryForSources(state.sources, sourceLabel);
+    summary.count = sourceCount;
+    const filePathPattern = pathPatternForSources(state.sources);
+    if (filePathPattern) summary.filePathPattern = filePathPattern;
     console.log(`${LOG_PREFIX} saving source summary:`, {
       mode: state.mode,
       rootLabel: state.referencePath,
       summaryLabel: summary.sourceLabel,
       fileCount: summary.count,
+      filePathPattern: summary.filePathPattern,
       sampleNames: summary.sampleNames,
     });
-    chrome.storage.local.set({
+    const payload = {
       photoReferencePath: state.referencePath,
       localPhotoSourceMode: state.mode,
       localPhotoSourceSummary: summary,
-    });
+    };
+    storageSet(chrome.storage.local, payload, "local");
+    storageSet(chrome.storage.sync, payload, "sync backup");
   }
 
   function renderSavedSummary() {
@@ -163,13 +362,17 @@
     }
   }
 
-  function applySources(sources, sourceLabelText, referencePath = "") {
+  function applySources(sources, sourceLabelText, referencePath = "", sourceMode = FOLDER_SOURCE_MODE) {
     if (!sources.length) {
       return false;
     }
 
-    state.mode = FOLDER_SOURCE_MODE;
+    state.mode = sourceMode;
     state.sources = sources;
+    if (sourceMode === REFERENCE_SOURCE_MODE) {
+      setSavedPermissionHandle(null);
+    }
+    setNeedsFolderReselect(false);
     const detectedPath = referencePath || commonRootPath(sources) || sourceLabelText;
     if (detectedPath) {
       state.referencePath = normalizeReferencePath(detectedPath);
@@ -184,10 +387,6 @@
     saveSummary(sourceLabelText || state.referencePath);
     renderList();
     return true;
-  }
-
-  function applyFiles(files, sourceLabelText, referencePath = "") {
-    return applySources(uniqueImageFiles(files), sourceLabelText, referencePath);
   }
 
   function openDatabase() {
@@ -244,23 +443,81 @@
     });
   }
 
-  function deleteStoredDirectoryHandle() {
-    if (!("indexedDB" in window)) return;
-    withHandleStore("readwrite", (store) => {
-      store.delete(ACTIVE_DIRECTORY_HANDLE_KEY);
-    }).catch(() => {});
-  }
-
   async function ensureDirectoryPermission(handle, requestAccess = false) {
     const options = { mode: "read" };
-    const currentPermission = await handle.queryPermission(options);
-    console.log(`${LOG_PREFIX} folder permission for handle name:`, handle.name, currentPermission);
-    if (currentPermission === "granted") return true;
-    if (!requestAccess) return false;
+    try {
+      const currentPermission = await handle.queryPermission(options);
+      console.log(`${LOG_PREFIX} folder permission for handle name:`, handle.name, currentPermission);
+      if (currentPermission === "granted") return true;
+      if (!requestAccess) return false;
 
-    const requestedPermission = await handle.requestPermission(options);
-    console.log(`${LOG_PREFIX} requested folder permission for handle name:`, handle.name, requestedPermission);
-    return requestedPermission === "granted";
+      const requestedPermission = await handle.requestPermission(options);
+      console.log(`${LOG_PREFIX} requested folder permission for handle name:`, handle.name, requestedPermission);
+      return requestedPermission === "granted";
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} unable to verify folder permission for handle name:`, handle.name, err);
+      return false;
+    }
+  }
+
+  function chromeCallback(method, ...args) {
+    return new Promise((resolve) => {
+      if (typeof method !== "function") {
+        resolve(false);
+        return;
+      }
+
+      method(...args, (result) => {
+        const err = chrome.runtime?.lastError;
+        if (err) {
+          console.warn(`${LOG_PREFIX} Chrome permission API warning:`, err.message);
+          resolve(false);
+          return;
+        }
+
+        resolve(Boolean(result));
+      });
+    });
+  }
+
+  async function isFileSchemeAccessAllowed() {
+    const method = chrome.extension?.isAllowedFileSchemeAccess;
+    if (typeof method !== "function") return true;
+
+    try {
+      return Boolean(await method.call(chrome.extension));
+    } catch (err) {
+      console.warn(`${LOG_PREFIX} unable to check file URL access:`, err);
+      return false;
+    }
+  }
+
+  async function ensureFileUrlAccess(requestAccess = false) {
+    const permission = { origins: [FILE_URL_ORIGIN] };
+    const permissionsApi = chrome.permissions;
+
+    if (await isFileSchemeAccessAllowed()) return true;
+    if (!permissionsApi?.contains) return false;
+
+    if (requestAccess) {
+      const grantedPermission = await chromeCallback(permissionsApi.request?.bind(permissionsApi), permission);
+      const allowedFileScheme = await isFileSchemeAccessAllowed();
+      console.log(`${LOG_PREFIX} requested file URL access:`, {
+        grantedPermission,
+        allowedFileScheme,
+      });
+      return grantedPermission && allowedFileScheme;
+    }
+
+    const hasPermission = await chromeCallback(permissionsApi.contains.bind(permissionsApi), permission);
+    if (hasPermission && await isFileSchemeAccessAllowed()) {
+      return true;
+    }
+
+    console.warn(`${LOG_PREFIX} file URL access is not enabled for referenced photos.`, {
+      extensionId: chrome.runtime?.id,
+    });
+    return false;
   }
 
   async function sourcesFromDirectoryHandle(handle, basePath = handle.name) {
@@ -285,32 +542,113 @@
     return sortSources(sources);
   }
 
-  async function applyDirectoryHandle(handle) {
-    const sources = await sourcesFromDirectoryHandle(handle);
-    return applySources(sources, handle.name, handle.name);
+  async function applyDirectoryHandle(handle, referencePath = "") {
+    const rootPath = referencePathForName(handle.name, referencePath || handle.name);
+    const sources = await sourcesFromDirectoryHandle(handle, rootPath || handle.name);
+    return applySources(sources, rootPath || handle.name, rootPath || handle.name, FOLDER_SOURCE_MODE);
+  }
+
+  async function applyReferencePathSources(summary = null, requestFileAccess = false) {
+    const referencePath = currentReferencePath();
+    if (!isAbsoluteReferencePath(referencePath)) return false;
+
+    const pattern = referencePatternFromSummary(summary);
+    if (!pattern) return false;
+
+    const hasFileUrlAccess = await ensureFileUrlAccess(requestFileAccess);
+    if (requestFileAccess && !hasFileUrlAccess) return false;
+
+    const sources = buildReferencePathSources(referencePath, pattern);
+    if (!sources.length) return false;
+
+    console.log(`${LOG_PREFIX} applying referenced file path source:`, {
+      referencePath,
+      fileCount: sources.length,
+      pattern,
+    });
+    return applySources(sources, referencePath, referencePath, REFERENCE_SOURCE_MODE);
+  }
+
+  async function requestSavedDirectoryPermission({ clearOnFailure = false } = {}) {
+    const handle = savedPermissionHandle;
+    const summary = savedPermissionSummary;
+    if (!handle) return false;
+
+    if (!(await ensureDirectoryPermission(handle, true))) {
+      console.warn(`${LOG_PREFIX} saved folder permission was not granted for handle name:`, handle.name);
+      if (clearOnFailure) setSavedPermissionHandle(null);
+      return false;
+    }
+
+    setSavedPermissionHandle(null);
+    const rootPath = referencePathForName(
+      handle.name,
+      state.referencePath,
+      summary?.sourceLabel,
+      referencePathCandidatesFromSummary(summary, handle.name),
+      handle.name,
+    );
+    if (await applyDirectoryHandle(handle, rootPath)) {
+      await storeDirectoryHandle(handle);
+      return true;
+    }
+
+    renderSavedSummary(summary);
+    return false;
+  }
+
+  async function showPhotoDirectoryPicker() {
+    try {
+      return await window.showDirectoryPicker({ id: DIRECTORY_PICKER_ID, mode: "read" });
+    } catch (err) {
+      if (err?.name !== "TypeError") throw err;
+      return window.showDirectoryPicker({ mode: "read" });
+    }
   }
 
   async function chooseDirectory() {
-    if (!supportsDirectoryHandles()) {
-      console.log(`${LOG_PREFIX} directory handles unavailable; using webkitdirectory input.`);
-      els.folderInput.click();
+    if (supportsDirectoryHandles()) {
+      try {
+        if (savedPermissionHandle) {
+          await requestSavedDirectoryPermission({ clearOnFailure: true });
+          return;
+        }
+
+        const handle = await showPhotoDirectoryPicker();
+        const rootPath = referencePathForName(handle.name, state.referencePath || handle.name);
+        logDirectoryHandleName("selected", handle.name);
+        if (!(await ensureDirectoryPermission(handle, true))) {
+          console.warn(`${LOG_PREFIX} folder permission was not granted for handle name:`, handle.name);
+          return;
+        }
+
+        if (await applyDirectoryHandle(handle, rootPath)) {
+          await storeDirectoryHandle(handle);
+        }
+      } catch (err) {
+        if (err?.name !== "AbortError") console.error(err);
+      }
       return;
     }
 
-    try {
-      const handle = await window.showDirectoryPicker({ mode: "read" });
-      logDirectoryHandleName("selected", handle.name);
-      if (!(await ensureDirectoryPermission(handle, true))) {
-        console.warn(`${LOG_PREFIX} folder permission was not granted for handle name:`, handle.name);
+    if (isAbsoluteReferencePath(currentReferencePath())) {
+      const filePathPattern = pathPatternForSources(state.sources) || savedPermissionSummary?.filePathPattern;
+      if (!filePathPattern) {
+        console.warn(`${LOG_PREFIX} directory handles unavailable; saved file pattern is required before reading a reference path.`);
         return;
       }
 
-      if (await applyDirectoryHandle(handle)) {
-        await storeDirectoryHandle(handle);
-      }
-    } catch (err) {
-      if (err?.name !== "AbortError") console.error(err);
+      const summary = {
+        ...(savedPermissionSummary || {}),
+        count: savedPermissionSummary?.count || state.sources.length,
+        filePathPattern,
+      };
+
+      await applyReferencePathSources(summary, true);
+      return;
     }
+
+    console.warn(`${LOG_PREFIX} directory handles unavailable; enter an absolute folder path to read referenced files.`);
   }
 
   async function restoreSavedDirectory(summary) {
@@ -329,18 +667,37 @@
           savedRootLabel: state.referencePath,
           savedSummaryLabel: summary?.sourceLabel,
         });
+        if (await applyReferencePathSources(summary, false)) {
+          return true;
+        }
+
+        setNeedsFolderReselect(true);
         return false;
       }
 
       logDirectoryHandleName("restored handle", handle.name);
 
+      const rootPath = referencePathForName(
+        handle.name,
+        state.referencePath,
+        summary?.sourceLabel,
+        referencePathCandidatesFromSummary(summary, handle.name),
+        handle.name,
+      );
+      if (rootPath && state.referencePath !== rootPath) {
+        state.referencePath = rootPath;
+        updateSourceUI();
+      }
+
       if (!(await ensureDirectoryPermission(handle))) {
         console.warn(`${LOG_PREFIX} saved folder needs fresh permission for handle name:`, handle.name);
+        setSavedPermissionHandle(handle, summary);
         renderSavedSummary(summary, "Select the folder again so Chrome can refresh access.");
         return true;
       }
 
-      if (!(await applyDirectoryHandle(handle))) {
+      setSavedPermissionHandle(null);
+      if (!(await applyDirectoryHandle(handle, rootPath))) {
         renderSavedSummary(summary);
       }
       return true;
@@ -350,38 +707,48 @@
     }
   }
 
-  function loadSavedState() {
-    chrome.storage.local.get(SOURCE_STORAGE_KEYS, (result) => {
-      state.referencePath = normalizeReferencePath(result.photoReferencePath);
-      const summary = result.localPhotoSourceSummary;
-      state.mode = FOLDER_SOURCE_MODE;
-      console.log(`${LOG_PREFIX} loaded saved source state:`, {
-        mode: state.mode,
-        savedRootLabel: state.referencePath,
-        savedCount: summary?.count || 0,
-        savedSummaryLabel: summary?.sourceLabel || "",
-        savedSampleNames: summary?.sampleNames || [],
-      });
-      renderList();
+  async function loadSavedState() {
+    const [localResult, syncResult] = await Promise.all([
+      storageGet(chrome.storage.local, SOURCE_STORAGE_KEYS),
+      storageGet(chrome.storage.sync, SOURCE_STORAGE_KEYS),
+    ]);
+    const { result, source } = chooseSavedState(localResult, syncResult);
+    if (source === "sync") {
+      storageSet(chrome.storage.local, result, "local source state from sync backup");
+    }
 
-      if (summary?.count) {
-        restoreSavedDirectory(summary).then((didRestore) => {
-          if (didRestore) return;
-          renderSavedSummary(summary);
-        });
-      } else {
-        renderList();
-      }
+    state.referencePath = normalizeReferencePath(result.photoReferencePath);
+    const summary = result.localPhotoSourceSummary;
+    state.mode = result.localPhotoSourceMode || FOLDER_SOURCE_MODE;
+    console.log(`${LOG_PREFIX} loaded saved source state:`, {
+      source,
+      mode: state.mode,
+      savedRootLabel: state.referencePath,
+      savedCount: summary?.count || 0,
+      savedSummaryLabel: summary?.sourceLabel || "",
+      savedSampleNames: summary?.sampleNames || [],
     });
+    renderList();
+
+    if (summary?.count) {
+      restoreSavedDirectory(summary).then((didRestore) => {
+        if (didRestore) return;
+        renderSavedSummary(summary);
+      });
+    } else if (state.referencePath) {
+      applyReferencePathSources(null, false).then((didApply) => {
+        if (!didApply) renderList();
+      });
+    } else {
+      renderList();
+    }
   }
 
   function wireLocalPhotos() {
-    els.folderInput = $("photo-source-folder-input");
     els.folderButton = $("photo-source-folder");
     els.pathInput = $("photo-source-path");
 
     if (
-      !els.folderInput ||
       !els.folderButton ||
       !els.pathInput
     ) {
@@ -390,24 +757,36 @@
     }
 
     els.folderButton.addEventListener("click", chooseDirectory);
+    els.pathInput.addEventListener("input", () => {
+      state.referencePath = normalizeReferencePath(els.pathInput.value);
+    });
     els.pathInput.addEventListener("change", () => {
       state.referencePath = normalizeReferencePath(els.pathInput.value);
-      saveSummary(state.referencePath);
-      renderList();
+      if (isAbsoluteReferencePath(state.referencePath)) {
+        const filePathPattern = pathPatternForSources(state.sources) || savedPermissionSummary?.filePathPattern;
+        if (filePathPattern) {
+          applyReferencePathSources({
+            count: state.sources.length || savedPermissionSummary?.count || 0,
+            filePathPattern,
+          }, false).then((didApply) => {
+            if (!didApply) {
+              saveSummary(state.referencePath, state.sources.length || savedPermissionSummary?.count || 0);
+              renderList();
+            }
+          });
+        } else {
+          saveSummary(state.referencePath, 0);
+          renderList();
+        }
+      } else {
+        saveSummary(state.referencePath, state.sources.length || savedPermissionSummary?.count || 0);
+        renderList();
+      }
     });
     els.pathInput.addEventListener("keydown", (event) => {
       if (event.key !== "Enter" || event.shiftKey) return;
       event.preventDefault();
       els.pathInput.blur();
-    });
-
-    els.folderInput.addEventListener("change", () => {
-      const files = Array.from(els.folderInput.files || []);
-      if (files.length) {
-        deleteStoredDirectoryHandle();
-        applyFiles(files, "Selected folder");
-      }
-      els.folderInput.value = "";
     });
 
     loadSavedState();
